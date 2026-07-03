@@ -32,7 +32,7 @@ PINCHBENCH_MODEL_ENV = "PINCHBENCH_MODEL"
 PINCHBENCH_API_KEY_ENV = "PINCHBENCH_API_KEY"
 INSPECT_EVALS_ARTIFACTS_DIR_ENV = "INSPECT_EVALS_ARTIFACTS_DIR"
 
-DEFAULT_DOCKER_IMAGE = "inspect-evals-pinchbench:local"
+DEFAULT_DOCKER_IMAGE = "pinch-wildclawbench-inspect-pinchbench:local"
 DEFAULT_SMOKE_SUITE = "task_sanity"
 DEFAULT_SUBSET_SUITE = "task_sanity,task_calendar,task_weather"
 
