@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from pinchbench.adapter import (
@@ -8,6 +10,7 @@ from pinchbench.adapter import (
     build_docker_command,
     inspect_score_from_result,
     model_alias,
+    parse_pinchbench_results,
     resolve_model_config,
     suite_for_mode,
 )
@@ -56,6 +59,43 @@ def test_inspect_score_from_result() -> None:
     assert value == pytest.approx(0.5)
     assert "PinchBench smoke" in explanation
     assert metadata["score"] == 0.5
+
+
+def test_parse_pinchbench_results_uses_native_grading_mean(tmp_path) -> None:
+    # Ungraded tasks carry an empty `grading` and are excluded from the
+    # denominator, matching the native runner's sum(grading.mean) over the
+    # number of graded tasks. Counting them as zero would understate the score.
+    result_path = tmp_path / "native-result.json"
+    result_path.write_text(
+        json.dumps(
+            {
+                "model": "example/model",
+                "tasks": [
+                    {
+                        "task_id": "task_sanity",
+                        "status": "success",
+                        "grading": {"mean": 0.5, "std": 0.0},
+                    },
+                    {
+                        "task_id": "task_basic",
+                        "status": "success",
+                        "grading": {"mean": 1.0, "std": 0.0},
+                    },
+                    {
+                        "task_id": "task_ungraded",
+                        "status": "error",
+                        "grading": {},
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = parse_pinchbench_results(result_path)
+
+    assert result["score"] == pytest.approx(0.75)
+    assert len(result["tasks"]) == 3
 
 
 def test_build_docker_command_selects_proxy_port_at_runtime(tmp_path) -> None:

@@ -328,9 +328,10 @@ def parse_pinchbench_results(result_path: Path) -> dict[str, Any]:
     score = data.get("score")
     if score is None:
         numeric_scores = [
-            task.get("score")
+            task["grading"]["mean"]
             for task in tasks
-            if isinstance(task.get("score"), (int, float))
+            if isinstance(task.get("grading"), dict)
+            and isinstance(task["grading"].get("mean"), (int, float))
         ]
         score = sum(numeric_scores) / len(numeric_scores) if numeric_scores else 0.0
     return {
