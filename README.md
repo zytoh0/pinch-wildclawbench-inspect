@@ -31,6 +31,11 @@ External assets and runtime dependencies are pinned for reproducibility:
 
 The wrappers require Docker and an OpenAI-compatible model endpoint reachable from the host.
 
+The model endpoint may be unauthenticated. `PINCHBENCH_API_KEY` and `WILDCLAWBENCH_API_KEY` (or the
+`api_key` task parameter) are optional; when they are unset the wrappers supply a placeholder key so
+that OpenClaw still resolves the provider, which is what locally served endpoints such as vLLM,
+SGLang, and Ollama need.
+
 ## Running PinchBench
 
 1. Clone the upstream PinchBench repository at the tested commit:

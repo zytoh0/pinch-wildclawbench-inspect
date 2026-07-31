@@ -36,6 +36,14 @@ DEFAULT_DOCKER_IMAGE = "pinch-wildclawbench-inspect-pinchbench:local"
 DEFAULT_SMOKE_SUITE = "task_sanity"
 DEFAULT_SUBSET_SUITE = "task_sanity,task_calendar,task_weather"
 
+# The upstream runner writes the literal "${OPENAI_API_KEY}" into OpenClaw's
+# provider config when no API key is configured, and OpenClaw refuses to call a
+# provider whose key cannot be resolved. Unauthenticated OpenAI-compatible
+# endpoints (vLLM, SGLang, Ollama) therefore need a non-empty placeholder in the
+# container environment, otherwise the agent issues no model requests at all and
+# the eval silently reports a zero score.
+UNAUTHENTICATED_API_KEY_PLACEHOLDER = "EMPTY"
+
 
 class BenchmarkInfrastructureError(RuntimeError):
     """Raised when external benchmark infrastructure is missing or misconfigured."""
@@ -295,8 +303,9 @@ def build_docker_command(
         "-e",
         f"PINCHBENCH_MODEL_ALIAS={alias}",
     ]
-    if api_key:
-        env_args.extend(["-e", "OPENAI_API_KEY", "-e", "OPENAI_COMPATIBLE_API_KEY"])
+    # Forwarded by name so the value is taken from the adapter environment
+    # instead of appearing in the container's argument list.
+    env_args.extend(["-e", "OPENAI_API_KEY", "-e", "OPENAI_COMPATIBLE_API_KEY"])
     return [
         "docker",
         "run",
@@ -321,16 +330,73 @@ def latest_native_result(native_dir: Path) -> Path | None:
     return max(candidates, key=lambda p: p.stat().st_mtime_ns) if candidates else None
 
 
+def category_aggregate_score(data: dict[str, Any]) -> float | None:
+    """Aggregate the native per-category totals the way PinchBench reports them.
+
+    The native summary has no top-level score field; it reports
+    ``category_scores`` as ``{CATEGORY: {"score": x, "max_score": y}}`` and
+    prints ``sum(score) / sum(max_score)`` as its overall score.
+    """
+    categories = data.get("category_scores")
+    if not isinstance(categories, dict):
+        return None
+    earned = 0.0
+    available = 0.0
+    for category in categories.values():
+        if not isinstance(category, dict):
+            continue
+        score = category.get("score")
+        max_score = category.get("max_score")
+        if isinstance(score, (int, float)) and isinstance(max_score, (int, float)):
+            earned += float(score)
+            available += float(max_score)
+    if available <= 0:
+        return None
+    return earned / available
+
+
+def task_score(task: dict[str, Any]) -> float | None:
+    """Return a single task's native score normalised to the 0-1 range."""
+    grading = task.get("grading")
+    if isinstance(grading, dict):
+        runs = grading.get("runs")
+        if isinstance(runs, list):
+            ratios = []
+            for run in runs:
+                if not isinstance(run, dict):
+                    continue
+                score = run.get("score")
+                max_score = run.get("max_score")
+                if not isinstance(score, (int, float)):
+                    continue
+                if isinstance(max_score, (int, float)) and max_score > 0:
+                    ratios.append(float(score) / float(max_score))
+                else:
+                    ratios.append(float(score))
+            if ratios:
+                return sum(ratios) / len(ratios)
+        mean = grading.get("mean")
+        if isinstance(mean, (int, float)):
+            return float(mean)
+    score = task.get("score")
+    return float(score) if isinstance(score, (int, float)) else None
+
+
 def parse_pinchbench_results(result_path: Path) -> dict[str, Any]:
     """Parse the native PinchBench JSON result into Inspect scorer metadata."""
     data = json.loads(result_path.read_text(encoding="utf-8"))
     tasks = data.get("tasks", [])
     score = data.get("score")
     if score is None:
+        score = category_aggregate_score(data)
+    if score is None:
+        # The native records keep each task's score under "grading", so fall
+        # back to the mean of the per-task scores rather than assuming a
+        # top-level "score" key exists on each task.
         numeric_scores = [
-            task.get("score")
-            for task in tasks
-            if isinstance(task.get("score"), (int, float))
+            value
+            for value in (task_score(task) for task in tasks if isinstance(task, dict))
+            if value is not None
         ]
         score = sum(numeric_scores) / len(numeric_scores) if numeric_scores else 0.0
     return {
@@ -375,9 +441,14 @@ def run_pinchbench(config: PinchBenchRunConfig) -> dict[str, Any]:
         json.dumps(command_record, indent=2), encoding="utf-8"
     )
     env = os.environ.copy()
-    if api_key:
-        env["OPENAI_API_KEY"] = api_key
-        env["OPENAI_COMPATIBLE_API_KEY"] = api_key
+    container_api_key = (
+        api_key
+        or env.get("OPENAI_API_KEY")
+        or env.get("OPENAI_COMPATIBLE_API_KEY")
+        or UNAUTHENTICATED_API_KEY_PLACEHOLDER
+    )
+    env["OPENAI_API_KEY"] = container_api_key
+    env["OPENAI_COMPATIBLE_API_KEY"] = container_api_key
     started = time.monotonic()
     try:
         completed = subprocess.run(
