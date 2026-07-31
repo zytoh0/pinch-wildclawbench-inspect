@@ -58,6 +58,28 @@ def test_inspect_score_from_result() -> None:
     assert metadata["score"] == 0.5
 
 
+def test_build_docker_command_always_forwards_api_key_env(tmp_path) -> None:
+    """OpenClaw resolves ${OPENAI_API_KEY} inside the container.
+
+    The variable has to be forwarded even when the endpoint is unauthenticated,
+    otherwise provider auth fails and the agent issues no model requests.
+    """
+    command = build_docker_command(
+        PinchBenchRunConfig(),
+        tmp_path / "benchmark",
+        tmp_path / "run",
+        "task_sanity",
+        "https://example.invalid/v1",
+        "provider/model",
+        None,
+    )
+
+    assert "OPENAI_API_KEY" in command
+    assert "OPENAI_COMPATIBLE_API_KEY" in command
+    # Forwarded by name only, so no key value can leak into the process list.
+    assert not any(arg.startswith("OPENAI_API_KEY=") for arg in command)
+
+
 def test_build_docker_command_selects_proxy_port_at_runtime(tmp_path) -> None:
     command = build_docker_command(
         PinchBenchRunConfig(),

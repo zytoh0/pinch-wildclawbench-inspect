@@ -36,6 +36,14 @@ DEFAULT_DOCKER_IMAGE = "pinch-wildclawbench-inspect-pinchbench:local"
 DEFAULT_SMOKE_SUITE = "task_sanity"
 DEFAULT_SUBSET_SUITE = "task_sanity,task_calendar,task_weather"
 
+# The upstream runner writes the literal "${OPENAI_API_KEY}" into OpenClaw's
+# provider config when no API key is configured, and OpenClaw refuses to call a
+# provider whose key cannot be resolved. Unauthenticated OpenAI-compatible
+# endpoints (vLLM, SGLang, Ollama) therefore need a non-empty placeholder in the
+# container environment, otherwise the agent issues no model requests at all and
+# the eval silently reports a zero score.
+UNAUTHENTICATED_API_KEY_PLACEHOLDER = "EMPTY"
+
 
 class BenchmarkInfrastructureError(RuntimeError):
     """Raised when external benchmark infrastructure is missing or misconfigured."""
@@ -295,8 +303,9 @@ def build_docker_command(
         "-e",
         f"PINCHBENCH_MODEL_ALIAS={alias}",
     ]
-    if api_key:
-        env_args.extend(["-e", "OPENAI_API_KEY", "-e", "OPENAI_COMPATIBLE_API_KEY"])
+    # Forwarded by name so the value is taken from the adapter environment
+    # instead of appearing in the container's argument list.
+    env_args.extend(["-e", "OPENAI_API_KEY", "-e", "OPENAI_COMPATIBLE_API_KEY"])
     return [
         "docker",
         "run",
@@ -375,9 +384,14 @@ def run_pinchbench(config: PinchBenchRunConfig) -> dict[str, Any]:
         json.dumps(command_record, indent=2), encoding="utf-8"
     )
     env = os.environ.copy()
-    if api_key:
-        env["OPENAI_API_KEY"] = api_key
-        env["OPENAI_COMPATIBLE_API_KEY"] = api_key
+    container_api_key = (
+        api_key
+        or env.get("OPENAI_API_KEY")
+        or env.get("OPENAI_COMPATIBLE_API_KEY")
+        or UNAUTHENTICATED_API_KEY_PLACEHOLDER
+    )
+    env["OPENAI_API_KEY"] = container_api_key
+    env["OPENAI_COMPATIBLE_API_KEY"] = container_api_key
     started = time.monotonic()
     try:
         completed = subprocess.run(
