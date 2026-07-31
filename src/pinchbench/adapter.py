@@ -330,16 +330,73 @@ def latest_native_result(native_dir: Path) -> Path | None:
     return max(candidates, key=lambda p: p.stat().st_mtime_ns) if candidates else None
 
 
+def category_aggregate_score(data: dict[str, Any]) -> float | None:
+    """Aggregate the native per-category totals the way PinchBench reports them.
+
+    The native summary has no top-level score field; it reports
+    ``category_scores`` as ``{CATEGORY: {"score": x, "max_score": y}}`` and
+    prints ``sum(score) / sum(max_score)`` as its overall score.
+    """
+    categories = data.get("category_scores")
+    if not isinstance(categories, dict):
+        return None
+    earned = 0.0
+    available = 0.0
+    for category in categories.values():
+        if not isinstance(category, dict):
+            continue
+        score = category.get("score")
+        max_score = category.get("max_score")
+        if isinstance(score, (int, float)) and isinstance(max_score, (int, float)):
+            earned += float(score)
+            available += float(max_score)
+    if available <= 0:
+        return None
+    return earned / available
+
+
+def task_score(task: dict[str, Any]) -> float | None:
+    """Return a single task's native score normalised to the 0-1 range."""
+    grading = task.get("grading")
+    if isinstance(grading, dict):
+        runs = grading.get("runs")
+        if isinstance(runs, list):
+            ratios = []
+            for run in runs:
+                if not isinstance(run, dict):
+                    continue
+                score = run.get("score")
+                max_score = run.get("max_score")
+                if not isinstance(score, (int, float)):
+                    continue
+                if isinstance(max_score, (int, float)) and max_score > 0:
+                    ratios.append(float(score) / float(max_score))
+                else:
+                    ratios.append(float(score))
+            if ratios:
+                return sum(ratios) / len(ratios)
+        mean = grading.get("mean")
+        if isinstance(mean, (int, float)):
+            return float(mean)
+    score = task.get("score")
+    return float(score) if isinstance(score, (int, float)) else None
+
+
 def parse_pinchbench_results(result_path: Path) -> dict[str, Any]:
     """Parse the native PinchBench JSON result into Inspect scorer metadata."""
     data = json.loads(result_path.read_text(encoding="utf-8"))
     tasks = data.get("tasks", [])
     score = data.get("score")
     if score is None:
+        score = category_aggregate_score(data)
+    if score is None:
+        # The native records keep each task's score under "grading", so fall
+        # back to the mean of the per-task scores rather than assuming a
+        # top-level "score" key exists on each task.
         numeric_scores = [
-            task.get("score")
-            for task in tasks
-            if isinstance(task.get("score"), (int, float))
+            value
+            for value in (task_score(task) for task in tasks if isinstance(task, dict))
+            if value is not None
         ]
         score = sum(numeric_scores) / len(numeric_scores) if numeric_scores else 0.0
     return {
