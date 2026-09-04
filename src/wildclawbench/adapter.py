@@ -5,6 +5,7 @@ from enum import Enum
 import json
 import os
 import random
+import re
 import shutil
 import socket
 import string
@@ -17,6 +18,7 @@ from pathlib import Path
 from typing import Any, Literal
 from urllib.request import Request, urlopen
 
+import yaml
 
 from wildclawbench.openclaw_compat import (
     apply_wildclawbench_openclaw_compat,
@@ -35,6 +37,7 @@ WILDCLAWBENCH_ROOT_ENV = "WILDCLAWBENCH_ROOT"
 WILDCLAWBENCH_MODEL_BASE_URL_ENV = "WILDCLAWBENCH_MODEL_BASE_URL"
 WILDCLAWBENCH_MODEL_ENV = "WILDCLAWBENCH_MODEL"
 WILDCLAWBENCH_API_KEY_ENV = "WILDCLAWBENCH_API_KEY"
+WILDCLAWBENCH_JUDGE_MODEL_ENV = "WILDCLAWBENCH_JUDGE_MODEL"
 INSPECT_EVALS_ARTIFACTS_DIR_ENV = "INSPECT_EVALS_ARTIFACTS_DIR"
 
 DEFAULT_DOCKER_IMAGE = "pinch-wildclawbench-inspect-wildclawbench:local"
@@ -44,7 +47,24 @@ DEFAULT_SMOKE_TASK = (
     "tasks/06_Safety_Alignment/06_Safety_Alignment_task_1_file_overwrite.md"
 )
 DEFAULT_SUBSET_CATEGORY = "06_Safety_Alignment"
+DEFAULT_TASK_TIMEOUT_SECONDS = 2400
+# Inspect's default --max-samples is 10; each sample here is an agent container
+# plus its model traffic, so the solver bounds concurrency independently.
+DEFAULT_MAX_CONCURRENCY = 4
+PROVIDER_TIMEOUT_SECONDS = 600
 HTTP_OK = 200
+
+# WildClawBench's task data (``workspace/``) is distributed separately from the
+# code, as a HuggingFace dataset. The wrapper was tested against this revision.
+WORKSPACE_DATASET = "internlm/WildClawBench"
+WORKSPACE_DATASET_REVISION = "75f945578aa00cbdb8f46e4d42e4f4e98f704b4f"
+
+# 42 of the 60 tasks grade with an LLM/VLM judge that the upstream grading code
+# reaches through an OpenAI client configured from these variables. Upstream
+# points them at OpenRouter; the wrapper points them at the per-run proxy so the
+# judge is served by the user's endpoint. The API key must be non-empty because
+# the OpenAI client rejects an empty key before sending the request.
+UNAUTHENTICATED_API_KEY_PLACEHOLDER = "EMPTY"
 
 
 class BenchmarkInfrastructureError(RuntimeError):
@@ -53,9 +73,9 @@ class BenchmarkInfrastructureError(RuntimeError):
 
 @dataclass(frozen=True)
 class WildClawBenchRunConfig:
-    """Configuration for one WildClawBench adapter run."""
+    """Configuration shared by every WildClawBench task run in one eval."""
 
-    mode: BenchmarkMode = "smoke"
+    mode: BenchmarkMode = "full"
     task: str | None = None
     category: str | None = None
     benchmark_root: Path | None = None
@@ -67,11 +87,28 @@ class WildClawBenchRunConfig:
     model_base_url: str | None = None
     model: str | None = None
     api_key: str | None = None
-    timeout_seconds: int = 1200
-    parallel: int = 1
+    judge_model: str | None = None
+    model_extra_body: dict[str, Any] | str | None = None
+    timeout_seconds: int | None = DEFAULT_TASK_TIMEOUT_SECONDS
     thinking: str | None = "off"
     validate_endpoint: bool = True
     verbose: bool = False
+    max_concurrency: int = DEFAULT_MAX_CONCURRENCY
+
+
+@dataclass(frozen=True)
+class WildClawBenchTaskSpec:
+    """One native WildClawBench task, which becomes one Inspect sample."""
+
+    task_id: str
+    category: str
+    task_path: str
+    title: str
+    prompt: str
+    timeout_seconds: int | None
+    modality: str
+    needs_judge: bool
+    workspace_path: str | None
 
 
 def reserve_local_port() -> int:
@@ -88,17 +125,6 @@ def make_run_id(mode: str) -> str:
         random.choice(string.ascii_lowercase + string.digits) for _ in range(6)
     )
     return f"{mode}_{stamp}_{suffix}"
-
-
-def task_or_category_args(config: WildClawBenchRunConfig) -> list[str]:
-    """Resolve WildClawBench CLI selection arguments from Inspect task mode."""
-    if config.mode == "smoke":
-        return ["--task", config.task or DEFAULT_SMOKE_TASK]
-    if config.mode == "subset":
-        return ["--category", config.category or DEFAULT_SUBSET_CATEGORY]
-    if config.mode == "full":
-        return ["--category", config.category or "all"]
-    raise ValueError(f"Unsupported WildClawBench mode: {config.mode}")
 
 
 def _path_from_env(env_var: str) -> Path | None:
@@ -148,6 +174,24 @@ def resolve_model_config(config: WildClawBenchRunConfig) -> tuple[str, str, str 
             + " or pass task parameters."
         )
     return base_url.rstrip("/"), model, api_key or None
+
+
+def normalise_extra_body(
+    extra_body: dict[str, Any] | str | None,
+) -> dict[str, Any] | None:
+    """Accept ``model_extra_body`` as a dict or a JSON string."""
+    if extra_body is None or extra_body == "":
+        return None
+    if isinstance(extra_body, str):
+        extra_body = json.loads(extra_body)
+    if not isinstance(extra_body, dict):
+        raise BenchmarkInfrastructureError("model_extra_body must be a JSON object")
+    return extra_body or None
+
+
+def resolve_judge_model(config: WildClawBenchRunConfig, model: str) -> str:
+    """Resolve the judge model id, defaulting to the model under evaluation."""
+    return config.judge_model or os.environ.get(WILDCLAWBENCH_JUDGE_MODEL_ENV) or model
 
 
 def validate_model_endpoint(
@@ -218,8 +262,96 @@ def prepare_docker_image(image: str, docker_handling: DockerHandling | str) -> N
         )
 
 
-def copy_benchmark_tree(src: Path, dst: Path, smoke_workspace: bool) -> None:
-    """Copy upstream WildClawBench files into an isolated run directory."""
+def _section(body: str, heading: str) -> str:
+    match = re.search(
+        rf"^## {re.escape(heading)}\s*\n(.*?)(?=^## |\Z)",
+        body,
+        re.DOTALL | re.MULTILINE,
+    )
+    return match.group(1).strip() if match else ""
+
+
+def _strip_codeblock(raw: str) -> str:
+    raw = raw.strip()
+    if raw.startswith("```"):
+        lines = raw.splitlines()[1:]
+        if lines and lines[-1].strip().startswith("```"):
+            lines = lines[:-1]
+        return "\n".join(lines).strip()
+    return raw
+
+
+def parse_task_file(benchmark_root: Path, task_file: Path) -> WildClawBenchTaskSpec:
+    """Extract what the Inspect dataset needs from a WildClawBench task file.
+
+    Mirrors the upstream ``task_parser.parse_task_md``: YAML frontmatter with
+    ``id``/``name``/``category``/``timeout_seconds``/``modality`` followed by
+    ``##`` sections, of which ``Prompt``, ``Workspace Path`` and ``Env`` matter
+    here.
+    """
+    content = task_file.read_text(encoding="utf-8")
+    match = re.match(r"^---\s*\n(.*?)\n---\s*\n(.*)", content, re.DOTALL)
+    if not match:
+        raise BenchmarkInfrastructureError(f"YAML frontmatter not found: {task_file}")
+    frontmatter = yaml.safe_load(match.group(1)) or {}
+    body = match.group(2)
+    workspace_raw = _strip_codeblock(_section(body, "Workspace Path"))
+    workspace_path = workspace_raw.splitlines()[0].strip() if workspace_raw else None
+    env_section = _section(body, "Env")
+    timeout = frontmatter.get("timeout_seconds")
+    return WildClawBenchTaskSpec(
+        task_id=str(frontmatter.get("id") or task_file.stem),
+        category=str(frontmatter.get("category") or task_file.parent.name),
+        task_path=str(task_file.relative_to(benchmark_root)),
+        title=str(frontmatter.get("name") or task_file.stem),
+        prompt=_strip_codeblock(_section(body, "Prompt")) or body.strip(),
+        timeout_seconds=int(timeout) if isinstance(timeout, (int, float)) else None,
+        modality=str(frontmatter.get("modality") or ""),
+        needs_judge="JUDGE_MODEL" in env_section or "OPENROUTER" in env_section,
+        workspace_path=workspace_path,
+    )
+
+
+def list_task_specs(
+    benchmark_root: Path,
+    mode: BenchmarkMode,
+    task: str | None,
+    category: str | None,
+) -> list[WildClawBenchTaskSpec]:
+    """Build the per-task specs that become the Inspect dataset."""
+    tasks_dir = benchmark_root / "tasks"
+    if mode == "smoke" or task:
+        files = [benchmark_root / (task or DEFAULT_SMOKE_TASK)]
+    elif mode == "subset" or (category and category != "all"):
+        selected = category or DEFAULT_SUBSET_CATEGORY
+        category_dir = tasks_dir / selected
+        if not category_dir.is_dir():
+            raise BenchmarkInfrastructureError(
+                f"WildClawBench category {selected!r} not found under {tasks_dir}"
+            )
+        files = sorted(category_dir.glob("*task_*.md"))
+    elif mode == "full":
+        files = sorted(tasks_dir.glob("*/*task_*.md"))
+    else:
+        raise ValueError(f"Unsupported WildClawBench mode: {mode}")
+    specs = []
+    for task_file in files:
+        if not task_file.is_file():
+            raise BenchmarkInfrastructureError(
+                f"WildClawBench task file not found: {task_file}"
+            )
+        specs.append(parse_task_file(benchmark_root, task_file))
+    if not specs:
+        raise BenchmarkInfrastructureError("No WildClawBench tasks selected")
+    return specs
+
+
+def copy_benchmark_tree(src: Path, dst: Path) -> None:
+    """Stage an isolated, patchable copy of the upstream WildClawBench code.
+
+    The task data (``workspace/``) is large and read-only, so it is linked
+    rather than copied; the runner resolves task workspaces through the link.
+    """
     ignore = shutil.ignore_patterns(".git", "output", "__pycache__", ".pytest_cache")
     for name in ["eval", "src", "tasks", "skills", "assets"]:
         source = src / name
@@ -232,15 +364,43 @@ def copy_benchmark_tree(src: Path, dst: Path, smoke_workspace: bool) -> None:
     (dst / "dotenv.py").write_text(
         "def load_dotenv(*args, **kwargs):\n    return False\n", encoding="utf-8"
     )
-    if smoke_workspace:
-        workspace = (
-            dst / "workspace" / "06_Safety_Alignment" / "task_1_file_overwrite" / "exec"
-        )
-        workspace.mkdir(parents=True, exist_ok=True)
-        (workspace / "summary.md").write_text(
+    workspace = src / "workspace"
+    if workspace.is_dir():
+        (dst / "workspace").symlink_to(workspace, target_is_directory=True)
+
+
+def ensure_task_workspace(
+    benchmark_root: Path, bench_dir: Path, spec: WildClawBenchTaskSpec
+) -> None:
+    """Fail clearly when a task's data has not been downloaded.
+
+    Only the default smoke task can be staged without the dataset: its
+    workspace is a single protected file, which is written here so the wrapper
+    can be smoke-tested before the 0.9 GB dataset is fetched.
+    """
+    if not spec.workspace_path:
+        return
+    relative = Path(spec.workspace_path)
+    host_path = (
+        relative if relative.is_absolute() else (benchmark_root / relative)
+    ).resolve()
+    if host_path.is_dir():
+        return
+    if spec.task_path == DEFAULT_SMOKE_TASK:
+        staged = bench_dir / relative
+        staged.mkdir(parents=True, exist_ok=True)
+        (staged / "summary.md").write_text(
             "Original protected summary. Do not overwrite this file.\n",
             encoding="utf-8",
         )
+        return
+    raise BenchmarkInfrastructureError(
+        f"Task data for {spec.task_id} is missing at {host_path}. Download the "
+        f"WildClawBench workspace dataset into {benchmark_root} first: "
+        f"hf download {WORKSPACE_DATASET} --repo-type dataset "
+        f"--revision {WORKSPACE_DATASET_REVISION} --include 'workspace/*' "
+        f"--local-dir {benchmark_root}"
+    )
 
 
 def write_models_config(
@@ -250,6 +410,9 @@ def write_models_config(
     provider_config: dict[str, Any] = {
         "baseUrl": base_url,
         "api": "openai-completions",
+        # OpenClaw aborts after 120 s without model output by default, which
+        # self-hosted endpoints under load routinely exceed on long prompts.
+        "timeoutSeconds": PROVIDER_TIMEOUT_SECONDS,
         "models": [
             {
                 "id": model,
@@ -280,7 +443,12 @@ def write_models_config(
 
 
 def start_model_proxy(
-    run_dir: Path, port: int, base_url: str, model: str, api_key: str | None
+    run_dir: Path,
+    port: int,
+    base_url: str,
+    model: str,
+    api_key: str | None,
+    extra_body: dict[str, Any] | None = None,
 ) -> subprocess.Popen[str]:
     """Start the local model alias proxy used by host-network task containers."""
     proxy_script = Path(__file__).parents[1] / "_openai_compatible_proxy.py"
@@ -288,6 +456,7 @@ def start_model_proxy(
     env = os.environ.copy()
     if api_key:
         env["OPENAI_COMPATIBLE_API_KEY"] = api_key
+    extra_args = ["--extra-body", json.dumps(extra_body)] if extra_body else []
     try:
         return subprocess.Popen(
             [
@@ -303,6 +472,7 @@ def start_model_proxy(
                 model,
                 "--actual-model",
                 model,
+                *extra_args,
             ],
             env=env,
             stdout=log,
@@ -327,6 +497,19 @@ def wait_for_proxy(port: int, timeout_seconds: float = 10.0) -> None:
     raise BenchmarkInfrastructureError(
         f"WildClawBench model proxy did not become ready on {url}"
     )
+
+
+def judge_environment(
+    proxy_base_url: str, judge_model: str, api_key: str | None
+) -> dict[str, str]:
+    """Environment the upstream grading code reads to reach its LLM/VLM judge."""
+    key = api_key or UNAUTHENTICATED_API_KEY_PLACEHOLDER
+    return {
+        "OPENROUTER_API_KEY": key,
+        "OPENROUTER_BASE_URL": proxy_base_url,
+        "JUDGE_MODEL": judge_model,
+        "MY_PROXY_API_KEY": key,
+    }
 
 
 def latest_summary(native_dir: Path) -> Path | None:
@@ -388,8 +571,52 @@ def parse_wildclawbench_results(native_dir: Path) -> dict[str, Any]:
     }
 
 
-def run_wildclawbench(config: WildClawBenchRunConfig) -> dict[str, Any]:
-    """Run WildClawBench and return a JSON-serialisable adapter result."""
+def judge_errors(scores: dict[str, Any]) -> list[str]:
+    """Return the per-metric judge errors the native grading recorded, if any."""
+    return [
+        f"{key}: {value}"
+        for key, value in scores.items()
+        if key.endswith("_judge_error") and value
+    ]
+
+
+def remove_task_containers(task_id: str) -> None:
+    """Remove containers the batch runner started for a task and could not clean up.
+
+    The runner names containers ``<category-prefix>_task_<n>_<model>_<stamp>``;
+    matching on the task prefix is enough because only this task's containers
+    carry it within one run.
+    """
+    prefix = re.sub(r"^(\d+)_.*?_(task_\d+)_.*$", r"\1_\2", task_id)
+    listing = subprocess.run(
+        ["docker", "ps", "-aq", "--filter", f"name=^{prefix}_"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    ids = listing.stdout.split()
+    if ids:
+        subprocess.run(
+            ["docker", "rm", "-f", *ids], capture_output=True, text=True, check=False
+        )
+
+
+@dataclass(frozen=True)
+class WildClawBenchRuntime:
+    """Infrastructure resolved once per eval and shared by every task run."""
+
+    benchmark_root: Path
+    output_root: Path
+    base_url: str
+    model: str
+    api_key: str | None
+    judge_model: str
+    endpoint: dict[str, Any]
+    run_id: str
+
+
+def prepare_runtime(config: WildClawBenchRunConfig) -> WildClawBenchRuntime:
+    """Validate the infrastructure a WildClawBench run depends on."""
     benchmark_root = resolve_benchmark_root(config)
     output_root = resolve_output_root(config)
     base_url, model, api_key = resolve_model_config(config)
@@ -400,49 +627,80 @@ def run_wildclawbench(config: WildClawBenchRunConfig) -> dict[str, Any]:
         if config.validate_endpoint
         else {"models_url": None, "models": []}
     )
-    run_dir = output_root / config.mode / make_run_id(config.mode)
+    return WildClawBenchRuntime(
+        benchmark_root=benchmark_root,
+        output_root=output_root,
+        base_url=base_url,
+        model=model,
+        api_key=api_key,
+        judge_model=resolve_judge_model(config, model),
+        endpoint=endpoint,
+        run_id=make_run_id(config.mode),
+    )
+
+
+def run_wildclawbench_task(
+    config: WildClawBenchRunConfig,
+    runtime: WildClawBenchRuntime,
+    spec: WildClawBenchTaskSpec,
+) -> dict[str, Any]:
+    """Run one native WildClawBench task and return a JSON-serialisable result."""
+    run_dir = runtime.output_root / config.mode / runtime.run_id / spec.task_id
     native_dir = run_dir / "native"
     bench_dir = run_dir / "bench"
     native_dir.mkdir(parents=True, exist_ok=False)
-    copy_benchmark_tree(
-        benchmark_root, bench_dir, smoke_workspace=config.mode == "smoke"
-    )
+    copy_benchmark_tree(runtime.benchmark_root, bench_dir)
+    ensure_task_workspace(runtime.benchmark_root, bench_dir, spec)
     apply_wildclawbench_openclaw_compat(bench_dir)
     port = reserve_local_port()
     proxy_base_url = f"http://127.0.0.1:{port}/v1"
     models_config = run_dir / "models_config.json"
     model_arg = write_models_config(
-        models_config, config.model_provider, proxy_base_url, model, api_key
+        models_config,
+        config.model_provider,
+        proxy_base_url,
+        runtime.model,
+        runtime.api_key,
     )
     command = [
         sys.executable,
         "eval/run_batch.py",
         "--agent-backend",
         config.agent_backend,
-        *task_or_category_args(config),
+        "--task",
+        spec.task_path,
         "--model",
         model_arg,
         "--models-config",
         str(models_config),
         "--parallel",
-        str(config.parallel),
+        "1",
     ]
     if config.thinking is not None:
         command.extend(["--thinking", config.thinking])
     command_record = {
         "benchmark": "wildclawbench",
         "mode": config.mode,
+        "task_id": spec.task_id,
         "run_dir": str(run_dir),
         "command": command,
         "docker_image": config.docker_image,
-        "api_key_provided": bool(api_key),
-        "endpoint": endpoint,
+        "api_key_provided": bool(runtime.api_key),
+        "judge_model": runtime.judge_model,
+        "endpoint": runtime.endpoint,
         "started_at": datetime.now(timezone.utc).isoformat(),
     }
     (run_dir / "command.json").write_text(
         json.dumps(command_record, indent=2), encoding="utf-8"
     )
-    proxy = start_model_proxy(run_dir, port, base_url, model, api_key)
+    proxy = start_model_proxy(
+        run_dir,
+        port,
+        runtime.base_url,
+        runtime.model,
+        runtime.api_key,
+        normalise_extra_body(config.model_extra_body),
+    )
     try:
         wait_for_proxy(port)
         env = os.environ.copy()
@@ -454,9 +712,9 @@ def run_wildclawbench(config: WildClawBenchRunConfig) -> dict[str, Any]:
                 "GATEWAY_PORT": str(18789 + random.randint(0, 2000)),
             }
         )
-        if api_key:
-            env["OPENROUTER_API_KEY"] = api_key
-            env["MY_PROXY_API_KEY"] = api_key
+        env.update(
+            judge_environment(proxy_base_url, runtime.judge_model, runtime.api_key)
+        )
         started = time.monotonic()
         try:
             completed = subprocess.run(
@@ -465,7 +723,7 @@ def run_wildclawbench(config: WildClawBenchRunConfig) -> dict[str, Any]:
                 env=env,
                 capture_output=True,
                 text=True,
-                timeout=config.timeout_seconds,
+                timeout=config.timeout_seconds or None,
                 check=False,
             )
             returncode = completed.returncode
@@ -473,6 +731,7 @@ def run_wildclawbench(config: WildClawBenchRunConfig) -> dict[str, Any]:
             stderr = completed.stderr
             timed_out = False
         except subprocess.TimeoutExpired as exc:
+            remove_task_containers(spec.task_id)
             returncode = 124
             stdout = (
                 exc.stdout
@@ -496,16 +755,33 @@ def run_wildclawbench(config: WildClawBenchRunConfig) -> dict[str, Any]:
     (run_dir / "stdout.log").write_text(stdout or "", encoding="utf-8")
     (run_dir / "stderr.log").write_text(stderr or "", encoding="utf-8")
     parsed = parse_wildclawbench_results(native_dir)
+    record = parsed["tasks"][0] if parsed["tasks"] else None
+    scores = (
+        record.get("scores")
+        if record and isinstance(record.get("scores"), dict)
+        else {}
+    )
     infrastructure_error = None
-    if returncode != 0 and parsed["task_count"] == 0:
+    if timed_out:
         infrastructure_error = (
-            f"WildClawBench runner exited {returncode} and produced no score JSON"
+            f"WildClawBench task {spec.task_id} exceeded the adapter timeout of "
+            f"{config.timeout_seconds} seconds; see {run_dir / 'stderr.log'}"
         )
-    status = "success" if infrastructure_error is None and not timed_out else "error"
+    elif record is None or record.get("score") is None:
+        infrastructure_error = (
+            f"WildClawBench runner exited {returncode} without a score for "
+            f"{spec.task_id}; see {run_dir / 'stdout.log'} and {run_dir / 'stderr.log'}"
+        )
+    elif record.get("error"):
+        infrastructure_error = (
+            f"WildClawBench grading failed for {spec.task_id}: {record['error']}"
+        )
     result = {
         "benchmark": "wildclawbench",
-        "status": status,
+        "status": "success" if infrastructure_error is None else "error",
         "mode": config.mode,
+        "task_id": spec.task_id,
+        "category": spec.category,
         "run_dir": str(run_dir),
         "stdout_log": str(run_dir / "stdout.log"),
         "stderr_log": str(run_dir / "stderr.log"),
@@ -514,7 +790,11 @@ def run_wildclawbench(config: WildClawBenchRunConfig) -> dict[str, Any]:
         "timed_out": timed_out,
         "duration_seconds": duration,
         "infrastructure_error": infrastructure_error,
-        **parsed,
+        "score": record.get("score") if record else None,
+        "scores": scores,
+        "judge_errors": judge_errors(scores),
+        "judge_model": runtime.judge_model,
+        "summary_path": parsed.get("summary_path"),
     }
     (run_dir / "inspect_adapter.json").write_text(
         json.dumps(result, indent=2), encoding="utf-8"
@@ -529,11 +809,18 @@ def inspect_score_from_result(
 ) -> tuple[float, str, dict[str, Any]]:
     """Convert adapter JSON into Inspect's Score fields."""
     value = float(result.get("score", 0.0) or 0.0)
-    scored = result.get("scored_task_count", 0)
-    total = result.get("task_count", 0)
-    explanation = (
-        f"WildClawBench {result.get('mode')} finished with status {result.get('status')}; "
-        f"mean score {value:.3f} across {scored}/{total} scored tasks. "
-        f"Artifacts: {result.get('run_dir')}"
+    scores = result.get("scores") or {}
+    metrics = ", ".join(
+        f"{key}={val}"
+        for key, val in scores.items()
+        if isinstance(val, (int, float)) and key != "overall_score"
     )
+    explanation = (
+        f"WildClawBench {result.get('task_id')} overall_score {value:.3f}"
+        + (f" ({metrics})" if metrics else "")
+        + "."
+    )
+    if result.get("judge_errors"):
+        explanation += " Judge errors: " + "; ".join(result["judge_errors"])
+    explanation += f" Artifacts: {result.get('run_dir')}"
     return value, explanation, dict(result)

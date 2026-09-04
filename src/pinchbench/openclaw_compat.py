@@ -38,10 +38,27 @@ def apply_pinchbench_openclaw_compat(benchmark_dir: Path) -> None:
         'bench_agent_dir = _get_agent_store_dir(agent_id) / "agent"',
         'bench_store_dir = _get_agent_store_dir(agent_id)\n    bench_agent_dir = bench_store_dir / "agent"',
     )
+    # OpenClaw aborts a request after 120 s without model output by default;
+    # self-hosted endpoints under load routinely exceed that on long prompts.
     source = _replace_once(
         source,
         '"apiKey": key_ref,',
-        '"apiKey": key_ref,\n            **({"authHeader": True, "request": {"auth": {"mode": "authorization-bearer", "token": key_ref}}} if key_ref else {}),',
+        '"apiKey": key_ref,\n            "timeoutSeconds": int(os.environ.get("PINCHBENCH_PROVIDER_TIMEOUT_SECONDS", "600")),\n            **({"authHeader": True, "request": {"auth": {"mode": "authorization-bearer", "token": key_ref}}} if key_ref else {}),',
+    )
+    # The direct ``openai/<model>`` judge backend hardcodes api.openai.com. Honour
+    # OPENAI_BASE_URL (the OpenAI SDK convention) so the judge can be served by
+    # the same OpenAI-compatible endpoint as the agent via the per-run proxy.
+    source = _replace_once(
+        source,
+        '"https://api.openai.com/v1/chat/completions",',
+        'os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/") + "/chat/completions",',
+    )
+    # Reasoning models spend the judge's 2048-token completion budget thinking
+    # and return an empty answer; let the adapter raise the cap.
+    source = _replace_once(
+        source,
+        '"max_completion_tokens": 2048,',
+        '"max_completion_tokens": int(os.environ.get("PINCHBENCH_JUDGE_MAX_TOKENS", "2048")),',
     )
     source = _replace_once(
         source,

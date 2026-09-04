@@ -8,40 +8,49 @@ from typing import Literal
 from inspect_ai import Task, task
 from inspect_ai.dataset import Sample
 from inspect_ai.model import ModelOutput
-from inspect_ai.scorer import Score, Target, mean, scorer, stderr
+from inspect_ai.scorer import Score, Target, grouped, mean, scorer, stderr
 from inspect_ai.solver import Generate, Solver, TaskState, solver
 
-from wildclawbench.adapter import DockerHandling
 from wildclawbench.adapter import (
     DEFAULT_AGENT_BACKEND,
     DEFAULT_DOCKER_IMAGE,
+    DEFAULT_MAX_CONCURRENCY,
     DEFAULT_MODEL_PROVIDER,
+    DEFAULT_TASK_TIMEOUT_SECONDS,
     BenchmarkInfrastructureError,
+    DockerHandling,
     WildClawBenchRunConfig,
+    WildClawBenchRuntime,
+    WildClawBenchTaskSpec,
     inspect_score_from_result,
-    run_wildclawbench,
+    list_task_specs,
+    prepare_runtime,
+    resolve_benchmark_root,
+    run_wildclawbench_task,
 )
 
 
 @solver
-def wildclawbench_runner(config: WildClawBenchRunConfig) -> Solver:
-    """Run the external WildClawBench harness as an Inspect solver."""
+def wildclawbench_runner(
+    config: WildClawBenchRunConfig, specs: dict[str, WildClawBenchTaskSpec]
+) -> Solver:
+    """Run one native WildClawBench task per sample through the batch runner."""
+
+    runtime: WildClawBenchRuntime | None = None
+    runtime_lock = asyncio.Lock()
+    slots = asyncio.Semaphore(max(1, config.max_concurrency))
 
     async def solve(state: TaskState, generate: Generate) -> TaskState:
-        try:
-            result = await asyncio.to_thread(run_wildclawbench, config)
-        except BenchmarkInfrastructureError as exc:
-            result = {
-                "benchmark": "wildclawbench",
-                "status": "infrastructure_error",
-                "score": 0.0,
-                "scored_task_count": 0,
-                "task_count": 0,
-                "mode": config.mode,
-                "infrastructure_error": str(exc),
-            }
+        nonlocal runtime
+        async with runtime_lock:
+            if runtime is None:
+                runtime = await asyncio.to_thread(prepare_runtime, config)
+        async with slots:
+            result = await asyncio.to_thread(
+                run_wildclawbench_task, config, runtime, specs[str(state.sample_id)]
+            )
         state.output = ModelOutput.from_content(
-            model=config.model or "wildclawbench-adapter",
+            model=runtime.model,
             content=json.dumps(result, indent=2),
         )
         return state
@@ -49,9 +58,9 @@ def wildclawbench_runner(config: WildClawBenchRunConfig) -> Solver:
     return solve
 
 
-@scorer(metrics=[mean(), stderr()])
+@scorer(metrics=[mean(), stderr(), grouped(mean(), "category", all=False)])
 def wildclawbench_scorer():
-    """Score adapter output using the native WildClawBench aggregate score."""
+    """Score each sample with the native WildClawBench overall_score for its task."""
 
     async def score(state: TaskState, target: Target) -> Score:
         try:
@@ -69,7 +78,7 @@ def wildclawbench_scorer():
 
 @task
 def wildclawbench(
-    mode: Literal["smoke", "subset", "full"] = "smoke",
+    mode: Literal["smoke", "subset", "full"] = "full",
     task: str | None = None,
     category: str | None = None,
     benchmark_root: str | None = None,
@@ -81,17 +90,31 @@ def wildclawbench(
     model_base_url: str | None = None,
     model: str | None = None,
     api_key: str | None = None,
-    timeout_seconds: int = 1200,
-    parallel: int = 1,
+    judge_model: str | None = None,
+    model_extra_body: dict | str | None = None,
+    timeout_seconds: int | None = DEFAULT_TASK_TIMEOUT_SECONDS,
     thinking: str | None = "off",
     validate_endpoint: bool = True,
     verbose: bool = False,
+    max_concurrency: int = DEFAULT_MAX_CONCURRENCY,
 ) -> Task:
     """Create an Inspect task that runs WildClawBench through its native harness.
 
-    The native harness requires a pinned WildClawBench checkout and an
-    OpenAI-compatible model endpoint. These are supplied via task parameters or
-    the environment variables documented in the benchmark README.
+    Every native WildClawBench task is one Inspect sample, so ``--limit``,
+    ``--sample-id`` and ``--max-samples`` behave as they do for any other eval and
+    per-task grades are visible in the log. ``mode`` picks the default task
+    selection (``smoke``: one safety task, ``subset``: one category, ``full``:
+    all 60 tasks); ``task`` (a task file path) or ``category`` override it.
+
+    The native harness requires a pinned WildClawBench checkout with the task
+    data downloaded into it, and an OpenAI-compatible model endpoint. The LLM/VLM
+    judge is served by the same endpoint unless ``judge_model`` names another
+    model it exposes. ``model_extra_body`` is a JSON object merged into every
+    chat completion the proxy forwards, for server-specific fields such as
+    vLLM/SGLang's ``{"chat_template_kwargs": {"enable_thinking": false}}``; the
+    native judge snippets allow as few as 128 completion tokens, which a
+    reasoning model otherwise spends thinking. At most ``max_concurrency``
+    task containers run at once regardless of ``--max-samples``.
     """
     config = WildClawBenchRunConfig(
         mode=mode,
@@ -106,22 +129,37 @@ def wildclawbench(
         model_base_url=model_base_url,
         model=model,
         api_key=api_key,
+        judge_model=judge_model,
+        model_extra_body=model_extra_body,
         timeout_seconds=timeout_seconds,
-        parallel=parallel,
         thinking=thinking,
         validate_endpoint=validate_endpoint,
         verbose=verbose,
+        max_concurrency=max_concurrency,
     )
+    try:
+        specs = list_task_specs(resolve_benchmark_root(config), mode, task, category)
+    except BenchmarkInfrastructureError as exc:
+        raise ValueError(f"Cannot build the WildClawBench dataset: {exc}") from exc
     return Task(
         dataset=[
             Sample(
-                input=f"Run WildClawBench in {mode} mode through the Dockerized adapter.",
-                target="benchmark_score",
-                id=f"wildclawbench-{mode}",
-                metadata={"mode": mode, "task": task, "category": category},
+                input=spec.prompt,
+                target="native_grade",
+                id=spec.task_id,
+                metadata={
+                    "task_name": spec.title,
+                    "category": spec.category,
+                    "modality": spec.modality,
+                    "needs_judge": spec.needs_judge,
+                    "native_timeout_seconds": spec.timeout_seconds,
+                    "task_path": spec.task_path,
+                    "mode": mode,
+                },
             )
+            for spec in specs
         ],
-        solver=wildclawbench_runner(config),
+        solver=wildclawbench_runner(config, {spec.task_id: spec for spec in specs}),
         scorer=wildclawbench_scorer(),
-        version=1,
+        version=2,
     )
