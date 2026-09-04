@@ -141,4 +141,4 @@ Reasoning models: the native judges allow as few as 128 completion tokens, which
 
 ## Register entry
 
-Both evals are listed in the [Inspect Evals register](https://github.com/UKGovernmentBEIS/inspect_evals/tree/main/register), which pins a commit of this repository. The `sync-inspect-evals-register` workflow opens a pull request against `inspect_evals` bumping that pin whenever `main` changes, so what is merged here becomes the registered version once that pull request is merged.
+Both evals are listed in the [Inspect Evals register](https://github.com/UKGovernmentBEIS/inspect_evals/tree/main/register), which pins a commit of this repository. The `sync-inspect-evals-register` workflow opens a pull request against `inspect_evals` bumping that pin whenever `main` changes and its test suite has passed, so what is merged here becomes the registered version once that pull request is merged.
