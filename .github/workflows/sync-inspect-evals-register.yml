@@ -1,0 +1,160 @@
+name: Sync Inspect Evals register
+
+# The Inspect Evals register lists external evals by a pinned commit of their
+# repository (its automated checks require a full 40-character SHA that exists
+# on the remote, with no override). To make whatever is merged on ``main`` the
+# registered version, this workflow opens a pull request against
+# UKGovernmentBEIS/inspect_evals that bumps ``source.repository_commit`` for
+# both entries to the new ``main`` commit and regenerates the derived READMEs.
+# One rolling branch is reused, so successive pushes update the same PR until a
+# maintainer merges it.
+#
+# Requires the repository secret ``INSPECT_EVALS_TOKEN``: a classic personal
+# access token with the ``public_repo`` scope belonging to an account that can
+# push to the ``inspect_evals`` fork named below and open pull requests upstream.
+# Until the secret is set the workflow only prints a warning.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "pyproject.toml"
+      - "uv.lock"
+      - "README.md"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sync-inspect-evals-register
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: UKGovernmentBEIS/inspect_evals
+  FORK_REPO: zytoh0/inspect_evals
+  SYNC_BRANCH: register/pinch-wildclawbench-sync
+  REGISTER_ENTRIES: pinchbench wildclawbench
+  GIT_AUTHOR_NAME: zytoh0
+  GIT_AUTHOR_EMAIL: zytoh0@users.noreply.github.com
+
+jobs:
+  bump-register-pin:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check that the register token is configured
+        id: token
+        env:
+          HAS_TOKEN: ${{ secrets.INSPECT_EVALS_TOKEN != '' }}
+        run: |
+          if [ "${HAS_TOKEN}" != "true" ]; then
+            echo "::warning::INSPECT_EVALS_TOKEN is not set; skipping the register sync. Add the secret to enable automatic register pull requests."
+          fi
+          echo "present=${HAS_TOKEN}" >> "${GITHUB_OUTPUT}"
+
+      - name: Check out this repository
+        if: steps.token.outputs.present == 'true'
+        uses: actions/checkout@v4
+
+      - name: Check out the inspect_evals fork
+        if: steps.token.outputs.present == 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.FORK_REPO }}
+          token: ${{ secrets.INSPECT_EVALS_TOKEN }}
+          path: inspect_evals
+          fetch-depth: 0
+
+      - name: Install uv
+        if: steps.token.outputs.present == 'true'
+        uses: astral-sh/setup-uv@v5
+
+      - name: Start the sync branch from upstream main
+        if: steps.token.outputs.present == 'true'
+        working-directory: inspect_evals
+        run: |
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
+          git fetch upstream main
+          git checkout -B "${SYNC_BRANCH}" upstream/main
+
+      - name: Bump source.repository_commit for both entries
+        if: steps.token.outputs.present == 'true'
+        working-directory: inspect_evals
+        run: |
+          for entry in ${REGISTER_ENTRIES}; do
+            file="register/${entry}/eval.yaml"
+            test -f "${file}"
+            sed -i -E "s|^(\s*repository_commit:\s*)[0-9a-f]{40}\s*$|\1${GITHUB_SHA}|" "${file}"
+            grep -q "repository_commit: ${GITHUB_SHA}" "${file}"
+          done
+          git diff --stat
+
+      - name: Regenerate the derived READMEs
+        if: steps.token.outputs.present == 'true'
+        working-directory: inspect_evals
+        run: |
+          uv sync --group dev
+          uv run python tools/generate_readmes.py --create-missing-readmes
+          # Committed READMEs are formatted by these hooks; CI fails on drift.
+          uv run --group dev pre-commit run mdformat --all-files || true
+          uv run --group dev pre-commit run markdownlint-fix --all-files || true
+          git status --short
+
+      - name: Commit and push
+        if: steps.token.outputs.present == 'true'
+        id: commit
+        working-directory: inspect_evals
+        run: |
+          git config user.name "${GIT_AUTHOR_NAME}"
+          git config user.email "${GIT_AUTHOR_EMAIL}"
+          if git diff --quiet; then
+            echo "Register already pins ${GITHUB_SHA}; nothing to do."
+            echo "changed=false" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+          git add -A register README.md
+          git commit -m "Repin PinchBench and WildClawBench to ${GITHUB_SHA:0:12}" \
+            -m "Automated bump from ${GITHUB_REPOSITORY}@${GITHUB_SHA} so the register tracks the current main of the wrapper repository."
+          git push --force-with-lease origin "${SYNC_BRANCH}"
+          echo "changed=true" >> "${GITHUB_OUTPUT}"
+
+      - name: Open or refresh the pull request
+        if: steps.token.outputs.present == 'true' && steps.commit.outputs.changed == 'true'
+        working-directory: inspect_evals
+        env:
+          GH_TOKEN: ${{ secrets.INSPECT_EVALS_TOKEN }}
+        run: |
+          fork_owner="${FORK_REPO%%/*}"
+          existing="$(gh pr list --repo "${UPSTREAM_REPO}" --head "${fork_owner}:${SYNC_BRANCH}" --state open --json number --jq '.[0].number')"
+          if [ -n "${existing}" ]; then
+            echo "Pull request #${existing} already tracks ${SYNC_BRANCH}; the push updated it."
+            gh pr comment "${existing}" --repo "${UPSTREAM_REPO}" \
+              --body "Updated to ${GITHUB_REPOSITORY}@${GITHUB_SHA}."
+            exit 0
+          fi
+          cat > pr_body.md <<EOF
+          Bumps \`source.repository_commit\` for the PinchBench and WildClawBench register entries to [\`${GITHUB_SHA:0:12}\`](https://github.com/${GITHUB_REPOSITORY}/commit/${GITHUB_SHA}), the current \`main\` of the wrapper repository, and regenerates the derived READMEs.
+
+          Opened automatically by the wrapper repository's \`sync-inspect-evals-register\` workflow; the commit history at the link above describes the change.
+
+          ## Checklist
+
+          - [x] Does this change affect existing eval(s)? If yes:
+
+            - [x] Have you checked your changes against the [evaluation checklist](https://github.com/UKGovernmentBEIS/inspect_evals/blob/main/EVALUATION_CHECKLIST.md)?
+            - [ ] Have the affected task version(s) [been incremented?](https://github.com/UKGovernmentBEIS/inspect_evals/blob/main/TASK_VERSIONING.md#when-to-bump-the-task-version) — N/A: register entries carry no in-repo task version; the pinned upstream commit is the version marker.
+            - [ ] Have the affected task changelog(s) been updated? [Example](https://github.com/UKGovernmentBEIS/inspect_evals/pull/1053). — N/A for register entries; the change is recorded in the upstream repository.
+
+          - [ ] Is this change consequential to users? If yes:
+
+            - [ ] Has \`uv run scriv create\` been run and the changelog fragment committed? See [Fragment Format](https://github.com/UKGovernmentBEIS/inspect_evals/blob/main/PACKAGE_VERSIONING.md#fragment-format). — N/A: only the commit two register entries point at changes.
+
+          - [ ] Does this change affect how future contributors write or submit evaluations (e.g. new required fields, changed tooling, updated conventions)? If yes:
+
+            - [ ] Has the relevant documentation been updated (e.g. [CONTRIBUTING.md](https://github.com/UKGovernmentBEIS/inspect_evals/blob/main/CONTRIBUTING.md), [EVALUATION_CHECKLIST.md](https://github.com/UKGovernmentBEIS/inspect_evals/blob/main/EVALUATION_CHECKLIST.md), [AGENTS.md](https://github.com/UKGovernmentBEIS/inspect_evals/blob/main/AGENTS.md))?
+          EOF
+          gh pr create --repo "${UPSTREAM_REPO}" --base main \
+            --head "${fork_owner}:${SYNC_BRANCH}" \
+            --title "Repin PinchBench and WildClawBench to ${GITHUB_SHA:0:12}" \
+            --body-file pr_body.md
