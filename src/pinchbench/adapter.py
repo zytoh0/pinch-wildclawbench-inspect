@@ -680,6 +680,18 @@ def grading_notes(task: dict[str, Any]) -> str:
     return " | ".join(notes)
 
 
+def container_api_key(api_key: str | None) -> str:
+    """Return the only credential that may enter the agent container.
+
+    The container runs model-produced commands with host networking, so it must
+    never receive credentials the eval was not given: only the key configured
+    for the benchmarked endpoint is forwarded, never a host ``OPENAI_API_KEY``
+    that may belong to another provider. Unauthenticated endpoints get a
+    placeholder because OpenClaw refuses providers whose key resolves empty.
+    """
+    return api_key or UNAUTHENTICATED_API_KEY_PLACEHOLDER
+
+
 def kill_container(name: str) -> None:
     """Stop a container left behind after the adapter timed out waiting for it."""
     subprocess.run(
@@ -761,14 +773,9 @@ def run_pinchbench_task(
         json.dumps(command_record, indent=2), encoding="utf-8"
     )
     env = os.environ.copy()
-    container_api_key = (
-        runtime.api_key
-        or env.get("OPENAI_API_KEY")
-        or env.get("OPENAI_COMPATIBLE_API_KEY")
-        or UNAUTHENTICATED_API_KEY_PLACEHOLDER
-    )
-    env["OPENAI_API_KEY"] = container_api_key
-    env["OPENAI_COMPATIBLE_API_KEY"] = container_api_key
+    key = container_api_key(runtime.api_key)
+    env["OPENAI_API_KEY"] = key
+    env["OPENAI_COMPATIBLE_API_KEY"] = key
     started = time.monotonic()
     try:
         completed = subprocess.run(

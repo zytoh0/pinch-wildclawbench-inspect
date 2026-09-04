@@ -9,6 +9,7 @@ from pinchbench.adapter import (
     BenchmarkInfrastructureError,
     PinchBenchRunConfig,
     build_docker_command,
+    container_api_key,
     container_name,
     inspect_score_from_result,
     list_task_specs,
@@ -344,3 +345,14 @@ def test_compat_patch_applies_to_pinned_upstream_snippets(tmp_path) -> None:
     assert "PINCHBENCH_JUDGE_MAX_TOKENS" in patched
     assert "PINCHBENCH_PROVIDER_TIMEOUT_SECONDS" in patched
     assert "use_local = True" in patched
+
+
+def test_container_api_key_never_falls_back_to_host_credentials(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The agent container runs model-produced commands with host networking, so
+    only the key configured for the benchmarked endpoint may be forwarded."""
+    monkeypatch.setenv("OPENAI_API_KEY", "host-key-for-another-provider")
+    monkeypatch.setenv("OPENAI_COMPATIBLE_API_KEY", "host-key-for-another-provider")
+    assert container_api_key(None) == "EMPTY"
+    assert container_api_key("endpoint-key") == "endpoint-key"
