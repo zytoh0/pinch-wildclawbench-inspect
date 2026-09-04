@@ -454,6 +454,9 @@ def start_model_proxy(
     proxy_script = Path(__file__).parents[1] / "_openai_compatible_proxy.py"
     log = (run_dir / "model_proxy.log").open("w", encoding="utf-8")
     env = os.environ.copy()
+    # Only the key configured for the benchmarked endpoint reaches the proxy;
+    # a host OPENAI_COMPATIBLE_API_KEY for some other provider must not.
+    env.pop("OPENAI_COMPATIBLE_API_KEY", None)
     if api_key:
         env["OPENAI_COMPATIBLE_API_KEY"] = api_key
     extra_args = ["--extra-body", json.dumps(extra_body)] if extra_body else []
