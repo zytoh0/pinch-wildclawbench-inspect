@@ -16,9 +16,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 RUN npm install -g openclaw@2026.6.10
 
+# The task grading snippets run inside this container. 39 of the 60 tasks call
+# their LLM/VLM judge through the ``openai`` client, and several load images or
+# PDFs while grading, so those libraries must be present alongside the agent's.
 RUN python3 -m pip install --break-system-packages --no-cache-dir \
     beautifulsoup4==4.15.0 \
     lxml==6.1.1 \
+    numpy==2.4.6 \
+    openai==2.46.0 \
+    pillow==12.3.0 \
+    pymupdf==1.28.2 \
     pypdf==6.14.2 \
     python-dotenv==1.2.2 \
     pyyaml==6.0.3 \

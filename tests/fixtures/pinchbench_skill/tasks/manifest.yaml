@@ -1,0 +1,14 @@
+# Trimmed copy of the upstream manifest layout (categories + core list).
+run_first:
+  - task_sanity
+
+core:
+  - task_sanity
+  - task_email
+
+categories:
+  productivity:
+    - task_sanity
+    - task_calendar
+  writing:
+    - task_email
